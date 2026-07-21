@@ -1,3 +1,6 @@
+azure-pipelines-seeker-v2.yml
+
+
 trigger: none
 
 pr: none
@@ -25,11 +28,14 @@ steps:
     targetType: 'inline'
     script: |
       $ErrorActionPreference = 'Stop'
+
       $logDirectory = "$(Build.ArtifactStagingDirectory)\seeker-logs"
       New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+
       Write-Host "Agent name: $(Agent.Name)"
       Write-Host "Agent computer: $(Agent.MachineName)"
       Write-Host "Source directory: $(Build.SourcesDirectory)"
+      Write-Host "Log directory: $logDirectory"
 
 - task: PowerShell@2
   displayName: 'Verify Node.js, npm, and Seeker Connectivity'
@@ -57,7 +63,12 @@ steps:
         throw "TCP connection to Seeker Server 192.168.1.20:8443 failed."
       }
 
-      $httpStatus = curl.exe -k -sS -o NUL -w "%{http_code}" "$(SEEKER_SERVER_URL)"
+      $httpStatus = curl.exe `
+        -k `
+        -sS `
+        -o NUL `
+        -w "%{http_code}" `
+        "$(SEEKER_SERVER_URL)"
 
       if ($LASTEXITCODE -ne 0) {
         throw "HTTPS connection to Seeker Server failed."
@@ -83,8 +94,10 @@ steps:
         throw "OWASP Juice Shop dependency installation or build failed."
       }
 
-      if (-not (Test-Path -LiteralPath "$(Build.SourcesDirectory)\build\app.js")) {
-        throw "Juice Shop build output was not found: build\app.js"
+      $applicationEntry = "$(Build.SourcesDirectory)\build\app.js"
+
+      if (-not (Test-Path -LiteralPath $applicationEntry)) {
+        throw "Juice Shop build output was not found: $applicationEntry"
       }
 
       Write-Host "OWASP Juice Shop dependencies and build completed successfully."
@@ -96,15 +109,25 @@ steps:
     script: |
       $ErrorActionPreference = 'Stop'
 
-      $seekerDirectory = Join-Path "$(Agent.TempDirectory)" "seeker-$(Build.BuildId)"
+      $seekerDirectory = Join-Path `
+        "$(Agent.TempDirectory)" `
+        "seeker-$(Build.BuildId)"
 
       if (Test-Path -LiteralPath $seekerDirectory) {
-        Remove-Item -LiteralPath $seekerDirectory -Recurse -Force
+        Remove-Item `
+          -LiteralPath $seekerDirectory `
+          -Recurse `
+          -Force
       }
 
-      New-Item -ItemType Directory -Path $seekerDirectory -Force | Out-Null
+      New-Item `
+        -ItemType Directory `
+        -Path $seekerDirectory `
+        -Force | Out-Null
 
       $agentUrl = "$(SEEKER_SERVER_URL)/rest/api/latest/installers/agents/binaries/NODEJS?projectKey=$(SEEKER_PROJECT_KEY)&flavor=TARGZ"
+
+      Write-Host "Installing Seeker Agent into: $seekerDirectory"
 
       npm install `
         --strict-ssl=false `
@@ -116,19 +139,44 @@ steps:
         throw "Seeker Node.js Agent installation failed."
       }
 
-      npm ls --prefix "$seekerDirectory" @seeker/agent
+      npm ls `
+        --prefix "$seekerDirectory" `
+        @seeker/agent
 
       if ($LASTEXITCODE -ne 0) {
         throw "Seeker Node.js Agent package validation failed."
       }
 
-      $seekerModule = Join-Path $seekerDirectory "node_modules\@seeker\agent"
+      $seekerModule = Join-Path `
+        $seekerDirectory `
+        "node_modules\@seeker\agent"
 
       if (-not (Test-Path -LiteralPath $seekerModule)) {
         throw "Seeker Agent module was not found: $seekerModule"
       }
 
-      Write-Host "##vso[task.setvariable variable=SEEKER_AGENT_MODULE]$seekerModule"
+      $packageJsonPath = Join-Path $seekerModule "package.json"
+      if (-not (Test-Path -LiteralPath $packageJsonPath)) {
+        throw "Seeker Agent package.json was not found: $packageJsonPath"
+      }
+
+      $packageJson = Get-Content `
+        -LiteralPath $packageJsonPath `
+        -Raw | ConvertFrom-Json
+
+      if ([string]::IsNullOrWhiteSpace($packageJson.main)) {
+        $seekerEntry = $seekerModule
+      }
+      else {
+        $seekerEntry = Join-Path $seekerModule $packageJson.main
+      }
+
+      if (-not (Test-Path -LiteralPath $seekerEntry)) {
+        throw "Seeker Agent entry file was not found: $seekerEntry"
+      }
+
+      Write-Host "Seeker Agent entry: $seekerEntry"
+      Write-Host "##vso[task.setvariable variable=SEEKER_AGENT_ENTRY]$seekerEntry"
       Write-Host "Seeker Node.js Agent installed successfully."
 
 - task: PowerShell@2
@@ -141,9 +189,15 @@ steps:
       $logDirectory = "$(Build.ArtifactStagingDirectory)\seeker-logs"
       $stdoutLog = Join-Path $logDirectory "juice-shop-stdout.log"
       $stderrLog = Join-Path $logDirectory "juice-shop-stderr.log"
+      $applicationEntry = "$(Build.SourcesDirectory)\build\app.js"
+      $seekerEntry = "$(SEEKER_AGENT_ENTRY)"
 
-      if (-not (Test-Path -LiteralPath "$(SEEKER_AGENT_MODULE)")) {
-        throw "Seeker Agent module is missing: $(SEEKER_AGENT_MODULE)"
+      if (-not (Test-Path -LiteralPath $applicationEntry)) {
+        throw "Juice Shop entry file is missing: $applicationEntry"
+      }
+
+      if (-not (Test-Path -LiteralPath $seekerEntry)) {
+        throw "Seeker Agent entry file is missing: $seekerEntry"
       }
 
       # LAB ONLY: remove this after installing a trusted Seeker certificate.
@@ -153,12 +207,18 @@ steps:
       $env:SEEKER_PROJECT_KEY = "$(SEEKER_PROJECT_KEY)"
       $env:PORT = "$(APP_PORT)"
 
-      $normalizedAgentPath = "$(SEEKER_AGENT_MODULE)" -replace "\\", "/"
-      $env:NODE_OPTIONS = "--require=$normalizedAgentPath"
+      $nodeExecutable = (Get-Command node.exe -ErrorAction Stop).Source
+      $arguments = "--require "$seekerEntry" "$applicationEntry""
+
+      Write-Host "Starting Juice Shop directly with node.exe."
+      Write-Host "Node executable: $nodeExecutable"
+      Write-Host "Application entry: $applicationEntry"
+      Write-Host "Seeker Agent entry: $seekerEntry"
+      Write-Host "Application URL: $(APP_URL)"
 
       $applicationProcess = Start-Process `
-        -FilePath "npm.cmd" `
-        -ArgumentList "start" `
+        -FilePath $nodeExecutable `
+        -ArgumentList $arguments `
         -WorkingDirectory "$(Build.SourcesDirectory)" `
         -RedirectStandardOutput $stdoutLog `
         -RedirectStandardError $stderrLog `
@@ -167,13 +227,38 @@ steps:
       try {
         $ready = $false
 
-        for ($attempt = 1; $attempt -le 60; $attempt++) {
+        # Seeker instrumentation can add startup time. Allow up to 10 minutes.
+        for ($attempt = 1; $attempt -le 300; $attempt++) {
           Start-Sleep -Seconds 2
 
           if ($applicationProcess.HasExited) {
-            if (Test-Path $stdoutLog) { Get-Content $stdoutLog -Tail 100 }
-            if (Test-Path $stderrLog) { Get-Content $stderrLog -Tail 100 }
+            Write-Host "Juice Shop process exited with code $($applicationProcess.ExitCode)."
+
+            if (Test-Path $stdoutLog) {
+              Write-Host "===== Juice Shop stdout ====="
+              Get-Content $stdoutLog -Tail 200
+            }
+
+            if (Test-Path $stderrLog) {
+              Write-Host "===== Juice Shop stderr ====="
+              Get-Content $stderrLog -Tail 200
+            }
+
             throw "Juice Shop failed to start."
+          }
+
+          if (($attempt % 15) -eq 0) {
+            Write-Host "Waiting for Juice Shop... attempt $attempt of 300"
+
+            if (Test-Path $stdoutLog) {
+              Write-Host "===== Latest stdout ====="
+              Get-Content $stdoutLog -Tail 30
+            }
+
+            if (Test-Path $stderrLog) {
+              Write-Host "===== Latest stderr ====="
+              Get-Content $stderrLog -Tail 30
+            }
           }
 
           try {
@@ -184,17 +269,30 @@ steps:
 
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
               $ready = $true
+              Write-Host "Juice Shop is ready. HTTP status: $($response.StatusCode)"
               break
             }
           }
           catch {
-            Write-Host "Waiting for Juice Shop... attempt $attempt of 60"
+            # Continue waiting until the timeout is reached.
           }
         }
 
         if (-not $ready) {
-          throw "Juice Shop did not become ready within 120 seconds."
+          Write-Host "===== Final Juice Shop stdout ====="
+          if (Test-Path $stdoutLog) {
+            Get-Content $stdoutLog -Tail 200
+          }
+
+          Write-Host "===== Final Juice Shop stderr ====="
+          if (Test-Path $stderrLog) {
+            Get-Content $stderrLog -Tail 200
+          }
+
+          throw "Juice Shop did not become ready within 600 seconds."
         }
+
+        Write-Host "Generating application traffic for Seeker."
 
         $testUrls = @(
           "$(APP_URL)/",
@@ -205,19 +303,31 @@ steps:
 
         foreach ($url in $testUrls) {
           Write-Host "Requesting: $url"
-          curl.exe -sS -o NUL -w "HTTP %{http_code}`n" "$url"
+
+          curl.exe `
+            -sS `
+            -o NUL `
+            -w "HTTP %{http_code}`n" `
+            "$url"
 
           if ($LASTEXITCODE -ne 0) {
             Write-Warning "Request failed: $url"
           }
         }
 
-        Write-Host "Waiting 30 seconds for Seeker to process runtime activity."
-        Start-Sleep -Seconds 30
+        Write-Host "Waiting 60 seconds for Seeker to process runtime activity."
+        Start-Sleep -Seconds 60
+
+        Write-Host "Runtime traffic generation completed."
       }
       finally {
         if ($null -ne $applicationProcess -and -not $applicationProcess.HasExited) {
-          taskkill.exe /PID $applicationProcess.Id /T /F | Out-Null
+          Write-Host "Stopping Juice Shop process tree."
+
+          taskkill.exe `
+            /PID $applicationProcess.Id `
+            /T `
+            /F | Out-Null
         }
       }
 
