@@ -205,7 +205,7 @@ steps:
       $env:PORT = "$(APP_PORT)"
 
       $nodeExecutable = (Get-Command node.exe -ErrorAction Stop).Source
-      $arguments = "--require "$seekerEntry" "$applicationEntry""
+      $arguments = '--require "{0}" "{1}"' -f $seekerEntry, $applicationEntry
 
       Write-Host "Starting Juice Shop directly with node.exe."
       Write-Host "Node executable: $nodeExecutable"
