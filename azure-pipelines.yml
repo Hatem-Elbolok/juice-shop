@@ -1,6 +1,3 @@
-azure-pipelines-seeker-v2.yml
-
-
 trigger: none
 
 pr: none
