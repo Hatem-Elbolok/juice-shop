@@ -1,0 +1,249 @@
+trigger: none
+
+pr: none
+
+pool:
+  name: CoverityPool
+  demands:
+    - Agent.OS -equals Windows_NT
+
+variables:
+  SEEKER_SERVER_URL: 'https://192.168.1.20:8443'
+  SEEKER_PROJECT_KEY: 'Juice-Shop-Azure'
+  APP_PORT: '3000'
+  APP_URL: 'http://127.0.0.1:3000'
+
+steps:
+- checkout: self
+  clean: true
+  fetchDepth: 1
+  displayName: 'Checkout OWASP Juice Shop'
+
+- task: PowerShell@2
+  displayName: 'Prepare Pipeline Directories'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $logDirectory = "$(Build.ArtifactStagingDirectory)\seeker-logs"
+      New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+      Write-Host "Agent name: $(Agent.Name)"
+      Write-Host "Agent computer: $(Agent.MachineName)"
+      Write-Host "Source directory: $(Build.SourcesDirectory)"
+
+- task: PowerShell@2
+  displayName: 'Verify Node.js, npm, and Seeker Connectivity'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = 'Stop'
+
+      node --version
+      if ($LASTEXITCODE -ne 0) {
+        throw "Node.js is not available to the Azure self-hosted agent."
+      }
+
+      npm --version
+      if ($LASTEXITCODE -ne 0) {
+        throw "npm is not available to the Azure self-hosted agent."
+      }
+
+      $connection = Test-NetConnection `
+        -ComputerName "192.168.1.20" `
+        -Port 8443 `
+        -WarningAction SilentlyContinue
+
+      if (-not $connection.TcpTestSucceeded) {
+        throw "TCP connection to Seeker Server 192.168.1.20:8443 failed."
+      }
+
+      $httpStatus = curl.exe -k -sS -o NUL -w "%{http_code}" "$(SEEKER_SERVER_URL)"
+
+      if ($LASTEXITCODE -ne 0) {
+        throw "HTTPS connection to Seeker Server failed."
+      }
+
+      if ([int]$httpStatus -lt 200 -or [int]$httpStatus -ge 400) {
+        throw "Seeker Server returned unexpected HTTP status: $httpStatus"
+      }
+
+      Write-Host "Seeker Server is reachable. HTTP status: $httpStatus"
+
+- task: PowerShell@2
+  displayName: 'Install and Build OWASP Juice Shop'
+  inputs:
+    targetType: 'inline'
+    workingDirectory: '$(Build.SourcesDirectory)'
+    script: |
+      $ErrorActionPreference = 'Stop'
+
+      npm install --no-audit --fund=false
+
+      if ($LASTEXITCODE -ne 0) {
+        throw "OWASP Juice Shop dependency installation or build failed."
+      }
+
+      if (-not (Test-Path -LiteralPath "$(Build.SourcesDirectory)\build\app.js")) {
+        throw "Juice Shop build output was not found: build\app.js"
+      }
+
+      Write-Host "OWASP Juice Shop dependencies and build completed successfully."
+
+- task: PowerShell@2
+  displayName: 'Download and Validate Seeker Node.js Agent'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = 'Stop'
+
+      $seekerDirectory = Join-Path "$(Agent.TempDirectory)" "seeker-$(Build.BuildId)"
+
+      if (Test-Path -LiteralPath $seekerDirectory) {
+        Remove-Item -LiteralPath $seekerDirectory -Recurse -Force
+      }
+
+      New-Item -ItemType Directory -Path $seekerDirectory -Force | Out-Null
+
+      $agentUrl = "$(SEEKER_SERVER_URL)/rest/api/latest/installers/agents/binaries/NODEJS?projectKey=$(SEEKER_PROJECT_KEY)&flavor=TARGZ"
+
+      npm install `
+        --strict-ssl=false `
+        --foreground-scripts `
+        --prefix "$seekerDirectory" `
+        "$agentUrl"
+
+      if ($LASTEXITCODE -ne 0) {
+        throw "Seeker Node.js Agent installation failed."
+      }
+
+      npm ls --prefix "$seekerDirectory" @seeker/agent
+
+      if ($LASTEXITCODE -ne 0) {
+        throw "Seeker Node.js Agent package validation failed."
+      }
+
+      $seekerModule = Join-Path $seekerDirectory "node_modules\@seeker\agent"
+
+      if (-not (Test-Path -LiteralPath $seekerModule)) {
+        throw "Seeker Agent module was not found: $seekerModule"
+      }
+
+      Write-Host "##vso[task.setvariable variable=SEEKER_AGENT_MODULE]$seekerModule"
+      Write-Host "Seeker Node.js Agent installed successfully."
+
+- task: PowerShell@2
+  displayName: 'Start Instrumented Juice Shop and Generate Test Traffic'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = 'Stop'
+
+      $logDirectory = "$(Build.ArtifactStagingDirectory)\seeker-logs"
+      $stdoutLog = Join-Path $logDirectory "juice-shop-stdout.log"
+      $stderrLog = Join-Path $logDirectory "juice-shop-stderr.log"
+
+      if (-not (Test-Path -LiteralPath "$(SEEKER_AGENT_MODULE)")) {
+        throw "Seeker Agent module is missing: $(SEEKER_AGENT_MODULE)"
+      }
+
+      # LAB ONLY: remove this after installing a trusted Seeker certificate.
+      $env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
+
+      $env:SEEKER_SERVER_URL = "$(SEEKER_SERVER_URL)"
+      $env:SEEKER_PROJECT_KEY = "$(SEEKER_PROJECT_KEY)"
+      $env:PORT = "$(APP_PORT)"
+
+      $normalizedAgentPath = "$(SEEKER_AGENT_MODULE)" -replace "\\", "/"
+      $env:NODE_OPTIONS = "--require=$normalizedAgentPath"
+
+      $applicationProcess = Start-Process `
+        -FilePath "npm.cmd" `
+        -ArgumentList "start" `
+        -WorkingDirectory "$(Build.SourcesDirectory)" `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -PassThru
+
+      try {
+        $ready = $false
+
+        for ($attempt = 1; $attempt -le 60; $attempt++) {
+          Start-Sleep -Seconds 2
+
+          if ($applicationProcess.HasExited) {
+            if (Test-Path $stdoutLog) { Get-Content $stdoutLog -Tail 100 }
+            if (Test-Path $stderrLog) { Get-Content $stderrLog -Tail 100 }
+            throw "Juice Shop failed to start."
+          }
+
+          try {
+            $response = Invoke-WebRequest `
+              -Uri "$(APP_URL)" `
+              -UseBasicParsing `
+              -TimeoutSec 5
+
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+              $ready = $true
+              break
+            }
+          }
+          catch {
+            Write-Host "Waiting for Juice Shop... attempt $attempt of 60"
+          }
+        }
+
+        if (-not $ready) {
+          throw "Juice Shop did not become ready within 120 seconds."
+        }
+
+        $testUrls = @(
+          "$(APP_URL)/",
+          "$(APP_URL)/rest/products/search?q=apple",
+          "$(APP_URL)/api/Challenges",
+          "$(APP_URL)/rest/admin/application-version"
+        )
+
+        foreach ($url in $testUrls) {
+          Write-Host "Requesting: $url"
+          curl.exe -sS -o NUL -w "HTTP %{http_code}`n" "$url"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Request failed: $url"
+          }
+        }
+
+        Write-Host "Waiting 30 seconds for Seeker to process runtime activity."
+        Start-Sleep -Seconds 30
+      }
+      finally {
+        if ($null -ne $applicationProcess -and -not $applicationProcess.HasExited) {
+          taskkill.exe /PID $applicationProcess.Id /T /F | Out-Null
+        }
+      }
+
+- task: PowerShell@2
+  displayName: 'Collect Pipeline Diagnostics'
+  condition: always()
+  inputs:
+    targetType: 'inline'
+    script: |
+      $logDirectory = "$(Build.ArtifactStagingDirectory)\seeker-logs"
+      New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+
+      @"
+      Build ID: $(Build.BuildId)
+      Agent: $(Agent.Name)
+      Seeker Server: $(SEEKER_SERVER_URL)
+      Seeker Project: $(SEEKER_PROJECT_KEY)
+      Application URL: $(APP_URL)
+      "@ | Out-File `
+        -FilePath (Join-Path $logDirectory "pipeline-summary.txt") `
+        -Encoding utf8
+
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish Seeker and Juice Shop Logs'
+  condition: always()
+  inputs:
+    targetPath: '$(Build.ArtifactStagingDirectory)\seeker-logs'
+    artifact: 'seeker-pipeline-logs'
+    publishLocation: 'pipeline'
